@@ -23,12 +23,23 @@ python3 -m unittest -v
 - `POST /api/cases/{id}/members`：授予 custodian、analyst 或 auditor 角色。
 - `POST /api/cases/{id}/evidence`：以 Base64 入册证据，服务端计算 SHA-256 和大小。
 - `GET /api/evidence/{id}`：查看元数据、完整保管事件链、完整性结果和衍生关系。
-- `POST /api/evidence/{id}/open`：保管员开箱。
-- `POST /api/evidence/{id}/transfer`：移交保管人并记录位置。
+- `POST /api/evidence/{id}/open`：保管员开箱，须携带当前链尾 `expected_tail`。
+- `POST /api/evidence/{id}/transfer`：移交保管人并记录位置，须携带当前链尾 `expected_tail`。
 - `POST /api/evidence/{id}/derive`：分析员从已开箱证据创建衍生证据。
 - `POST /api/evidence/{id}/hold`：审计员或案件创建人设置/解除法律保留。
-- `POST /api/evidence/{id}/release`：存在法律保留时拒绝释放。
-- `GET /api/cases/{id}/report`：校验所有证据哈希和每条事件链，导出完整报告。
+- `POST /api/evidence/{id}/retention`：保管员或审计员修改保留期限，修改后未释放证据须重新确认保管结论。
+- `POST /api/evidence/{id}/conclusion`：保管员或审计员重新确认保管结论。
+- `POST /api/evidence/{id}/release`：两名保管员分别见证释放，须携带当前链尾 `expected_tail`；存在法律保留或保管结论失效时拒绝释放。
+- `GET /api/cases/{id}/report`：校验所有证据哈希和每条事件链，核对释放见证并点名问题证据编号，导出完整报告。
 - 所有 `DELETE` 请求返回 405；证据和保管记录不提供删除接口。
+
+## 链尾并发与释放见证
+
+- 每次开箱、移交、释放提交都必须携带本次查看到的链尾 `expected_tail`（即 `GET /api/evidence/{id}` 返回的 `chain_tail.event_hash`）。服务端在 `BEGIN IMMEDIATE` 事务内核对链尾：若与当前链尾不一致，返回 `chain_conflict`，提示刷新重新查看后再提交。
+- 页面直接显示当前链尾；链位被占用时退回并提示重新查看。
+- 写盘失败（如数据库锁）会重试，重试仍沿用原链尾（失败事务已回滚，链尾未变）。
+- 释放须两名保管员分别见证：第一名保管员提交后状态为 `pending_release`，第二名不同保管员提交后才追加 `RELEASE` 事件并置为 `released`；同一名保管员重复见证返回 `duplicate_witness`。
+- 保留期限一经修改，未释放证据的保管结论立即失效，须重新确认后才能释放。
+- 报告按链核对哈希与事件链，并核对释放见证：发现断链（`broken_chain`）、重复见证（`duplicate_witness`）或缺少见证（`missing_witness`）时，在 `issues` 中点名证据编号。
 
 保管事件通过前一条事件哈希串联；报告会重新计算文件哈希和事件链。项目适合流程与完整性原型，不涵盖现实中的签名证书、WORM 存储、证据文件加密或司法辖区合规认证。

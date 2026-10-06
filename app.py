@@ -8,6 +8,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -89,6 +90,16 @@ class CustodyStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     case_id INTEGER NOT NULL REFERENCES cases(id), actor_id TEXT NOT NULL REFERENCES users(id),
                     action TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS custody_conclusions(
+                    evidence_id INTEGER PRIMARY KEY REFERENCES evidence(id),
+                    conclusion TEXT NOT NULL, retention_until TEXT NOT NULL,
+                    confirmed_by TEXT NOT NULL REFERENCES users(id), confirmed_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS release_witnesses(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    evidence_id INTEGER NOT NULL REFERENCES evidence(id), user_id TEXT NOT NULL REFERENCES users(id),
+                    witnessed_at TEXT NOT NULL, UNIQUE(evidence_id,user_id)
                 );
                 """
             )
@@ -196,6 +207,44 @@ class CustodyStore:
         )
         return cur.lastrowid, digest
 
+    def _current_tail(self, conn, evidence_id):
+        row = conn.execute(
+            "SELECT sequence,event_hash FROM custody_events WHERE evidence_id=? ORDER BY sequence DESC LIMIT 1", (evidence_id,)
+        ).fetchone()
+        return (row["sequence"], row["event_hash"]) if row else (0, "GENESIS")
+
+    def _tail_info(self, conn, evidence_id):
+        row = conn.execute(
+            "SELECT sequence,event_hash,created_at FROM custody_events WHERE evidence_id=? ORDER BY sequence DESC LIMIT 1", (evidence_id,)
+        ).fetchone()
+        return {"sequence": row["sequence"], "event_hash": row["event_hash"], "created_at": row["created_at"]} if row else None
+
+    def _check_expected_tail(self, conn, evidence_id, expected_tail):
+        if expected_tail is None:
+            return
+        _, current = self._current_tail(conn, evidence_id)
+        if current != expected_tail:
+            raise BusinessError("链位已被占用或链尾已变化，请刷新重新查看后再提交", 409, "chain_conflict")
+
+    def _conclusion_valid(self, conn, evidence_id):
+        row = conn.execute("SELECT retention_until FROM custody_conclusions WHERE evidence_id=?", (evidence_id,)).fetchone()
+        ev = conn.execute("SELECT retention_until FROM evidence WHERE id=?", (evidence_id,)).fetchone()
+        return row is not None and ev is not None and row["retention_until"] == ev["retention_until"]
+
+    def _run_write(self, operation):
+        """Run a write transaction, retrying on lock failures while keeping the original expected chain position."""
+        for attempt in range(3):
+            try:
+                with self.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    return operation(conn)
+            except BusinessError:
+                raise
+            except sqlite3.OperationalError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+
     def ingest_evidence(self, user_id, case_id, label, filename, content_b64, retention_until, custodian=None):
         label, filename = label.strip(), filename.strip()
         if not label or not filename:
@@ -222,6 +271,11 @@ class CustodyStore:
                 )
                 evidence_id = cur.lastrowid
                 self._append_event(conn, evidence_id, "INGEST", user_id, to_person=custodian, note=f"入册 SHA-256 {digest}")
+                conclusion_text = f"继续保管至 {retention_until}，保留期限届满后依法处理。"
+                conn.execute(
+                    "INSERT INTO custody_conclusions(evidence_id,conclusion,retention_until,confirmed_by,confirmed_at) VALUES(?,?,?,?,?)",
+                    (evidence_id, conclusion_text, retention_until, user_id, now()),
+                )
                 self._audit(conn, case_id, user_id, "evidence.ingest", {"evidence_id": evidence_id, "sha256": digest, "label": label})
                 return {"id": evidence_id, "label": label, "sha256": digest, "size": len(content), "status": "custody", "current_custodian": custodian}
             except sqlite3.IntegrityError:
@@ -246,45 +300,52 @@ class CustodyStore:
             result["integrity_valid"] = hashlib.sha256(row["content"]).hexdigest() == row["sha256"]
             result["events"] = [dict(x) for x in conn.execute("SELECT * FROM custody_events WHERE evidence_id=? ORDER BY sequence", (evidence_id,)).fetchall()]
             result["derived_children"] = [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (evidence_id,)).fetchall()]
+            result["chain_tail"] = self._tail_info(conn, evidence_id)
+            concl = conn.execute(
+                "SELECT conclusion,retention_until,confirmed_by,confirmed_at FROM custody_conclusions WHERE evidence_id=?", (evidence_id,)
+            ).fetchone()
+            result["custody_conclusion"] = dict(concl) if concl else None
+            result["conclusion_valid"] = self._conclusion_valid(conn, evidence_id)
+            result["release_witnesses"] = [
+                dict(x) for x in conn.execute("SELECT user_id,witnessed_at FROM release_witnesses WHERE evidence_id=? ORDER BY id", (evidence_id,)).fetchall()
+            ]
             if include_content:
                 result["content_b64"] = base64.b64encode(row["content"]).decode()
             return result
 
-    def transfer(self, user_id, evidence_id, to_person, location, note=""):
+    def transfer(self, user_id, evidence_id, to_person, location, note="", expected_tail=None):
         if not to_person.strip() or not location.strip():
             raise BusinessError("接收人和保管位置不能为空", 422, "invalid_transfer")
-        with self.connect() as conn:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                row = self._evidence(conn, evidence_id)
-                _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
-                if row["status"] == "released":
-                    raise BusinessError("已释放证据不能再移交", 409, "evidence_released")
-                self._append_event(conn, evidence_id, "TRANSFER", user_id, from_person=row["current_custodian"], to_person=to_person.strip(), location=location.strip(), note=note.strip())
-                conn.execute("UPDATE evidence SET current_custodian=? WHERE id=?", (to_person.strip(), evidence_id))
-                self._audit(conn, row["case_id"], user_id, "custody.transfer", {"evidence_id": evidence_id, "to": to_person.strip(), "location": location.strip()})
-                return {"id": evidence_id, "current_custodian": to_person.strip(), "location": location.strip()}
-            except Exception:
-                conn.rollback()
-                raise
 
-    def open_evidence(self, user_id, evidence_id, location, note=""):
+        def op(conn):
+            row = self._evidence(conn, evidence_id)
+            _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
+            self._check_expected_tail(conn, evidence_id, expected_tail)
+            if row["status"] == "released":
+                raise BusinessError("已释放证据不能再移交", 409, "evidence_released")
+            self._append_event(conn, evidence_id, "TRANSFER", user_id, from_person=row["current_custodian"], to_person=to_person.strip(), location=location.strip(), note=note.strip())
+            conn.execute("UPDATE evidence SET current_custodian=? WHERE id=?", (to_person.strip(), evidence_id))
+            self._audit(conn, row["case_id"], user_id, "custody.transfer", {"evidence_id": evidence_id, "to": to_person.strip(), "location": location.strip()})
+            return {"id": evidence_id, "current_custodian": to_person.strip(), "location": location.strip(), "chain_tail": self._tail_info(conn, evidence_id)}
+
+        return self._run_write(op)
+
+    def open_evidence(self, user_id, evidence_id, location, note="", expected_tail=None):
         if not location.strip():
             raise BusinessError("开箱地点不能为空", 422, "location_required")
-        with self.connect() as conn:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                row = self._evidence(conn, evidence_id)
-                _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
-                if row["status"] != "custody":
-                    raise BusinessError("只有处于封存保管状态的证据可以开箱", 409, "invalid_status")
-                self._append_event(conn, evidence_id, "OPEN", user_id, from_person=row["current_custodian"], location=location.strip(), note=note.strip())
-                conn.execute("UPDATE evidence SET status='opened' WHERE id=?", (evidence_id,))
-                self._audit(conn, row["case_id"], user_id, "evidence.open", {"evidence_id": evidence_id, "location": location.strip()})
-                return {"id": evidence_id, "status": "opened", "location": location.strip()}
-            except Exception:
-                conn.rollback()
-                raise
+
+        def op(conn):
+            row = self._evidence(conn, evidence_id)
+            _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
+            self._check_expected_tail(conn, evidence_id, expected_tail)
+            if row["status"] != "custody":
+                raise BusinessError("只有处于封存保管状态的证据可以开箱", 409, "invalid_status")
+            self._append_event(conn, evidence_id, "OPEN", user_id, from_person=row["current_custodian"], location=location.strip(), note=note.strip())
+            conn.execute("UPDATE evidence SET status='opened' WHERE id=?", (evidence_id,))
+            self._audit(conn, row["case_id"], user_id, "evidence.open", {"evidence_id": evidence_id, "location": location.strip()})
+            return {"id": evidence_id, "status": "opened", "location": location.strip(), "chain_tail": self._tail_info(conn, evidence_id)}
+
+        return self._run_write(op)
 
     def derive(self, user_id, evidence_id, method, label, filename, content_b64):
         if len(method.strip()) < 3 or not label.strip() or not filename.strip():
@@ -336,31 +397,89 @@ class CustodyStore:
             self._audit(conn, row["case_id"], user_id, "evidence.hold", {"evidence_id": evidence_id, "hold": bool(hold), "reason": reason.strip()})
             return {"id": evidence_id, "legal_hold": bool(hold)}
 
-    def release(self, user_id, evidence_id, recipient, note=""):
-        if not recipient.strip():
-            raise BusinessError("接收方不能为空", 422, "recipient_required")
+    def set_retention(self, user_id, evidence_id, retention_until, reason):
+        if len(reason.strip()) < 5:
+            raise BusinessError("保留期限变更原因至少 5 字", 422, "reason_required")
+        try:
+            deadline = date.fromisoformat(retention_until)
+        except (ValueError, TypeError):
+            raise BusinessError("保留期限格式错误", 422, "invalid_retention")
+        if deadline < date.today():
+            raise BusinessError("保留期限不能早于今天", 422, "invalid_retention")
         with self.connect() as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._evidence(conn, evidence_id)
-                _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
-                if row["legal_hold"]:
-                    raise BusinessError("存在法律保留，禁止释放证据", 409, "legal_hold_active")
-                if row["status"] == "released":
-                    raise BusinessError("证据已经释放", 409, "already_released")
-                self._append_event(conn, evidence_id, "RELEASE", user_id, from_person=row["current_custodian"], to_person=recipient.strip(), note=note.strip())
-                conn.execute("UPDATE evidence SET status='released' WHERE id=?", (evidence_id,))
-                self._audit(conn, row["case_id"], user_id, "evidence.release", {"evidence_id": evidence_id, "recipient": recipient.strip()})
-                return {"id": evidence_id, "status": "released", "recipient": recipient.strip()}
+                _, member = self._member(conn, row["case_id"], user_id, {"custodian", "auditor"})
+                conn.execute("UPDATE evidence SET retention_until=? WHERE id=?", (retention_until, evidence_id))
+                conn.execute("DELETE FROM custody_conclusions WHERE evidence_id=?", (evidence_id,))
+                self._audit(conn, row["case_id"], user_id, "evidence.retention", {"evidence_id": evidence_id, "retention_until": retention_until, "reason": reason.strip()})
+                return {"id": evidence_id, "retention_until": retention_until}
             except Exception:
                 conn.rollback()
                 raise
+
+    def confirm_conclusion(self, user_id, evidence_id, note=""):
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = self._evidence(conn, evidence_id)
+                _, member = self._member(conn, row["case_id"], user_id, {"custodian", "auditor"})
+                conclusion_text = f"继续保管至 {row['retention_until']}，保留期限届满后依法处理。"
+                conn.execute(
+                    """INSERT INTO custody_conclusions(evidence_id,conclusion,retention_until,confirmed_by,confirmed_at) VALUES(?,?,?,?,?)
+                       ON CONFLICT(evidence_id) DO UPDATE SET conclusion=excluded.conclusion, retention_until=excluded.retention_until,
+                          confirmed_by=excluded.confirmed_by, confirmed_at=excluded.confirmed_at""",
+                    (evidence_id, conclusion_text, row["retention_until"], user_id, now()),
+                )
+                self._audit(conn, row["case_id"], user_id, "evidence.conclusion", {"evidence_id": evidence_id, "retention_until": row["retention_until"], "note": note.strip()})
+                return {"id": evidence_id, "conclusion": conclusion_text, "retention_until": row["retention_until"], "confirmed_by": user_id}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def release(self, user_id, evidence_id, recipient, note="", expected_tail=None):
+        if not recipient.strip():
+            raise BusinessError("接收方不能为空", 422, "recipient_required")
+
+        def op(conn):
+            row = self._evidence(conn, evidence_id)
+            _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
+            if row["legal_hold"]:
+                raise BusinessError("存在法律保留，禁止释放证据", 409, "legal_hold_active")
+            if row["status"] == "released":
+                raise BusinessError("证据已经释放", 409, "already_released")
+            if not self._conclusion_valid(conn, evidence_id):
+                raise BusinessError("保管结论未确认或保留期限已变化，请重新确认保管结论后再释放", 409, "conclusion_required")
+            existing = [
+                r["user_id"] for r in conn.execute(
+                    "SELECT user_id FROM release_witnesses WHERE evidence_id=? ORDER BY id", (evidence_id,)
+                ).fetchall()
+            ]
+            if user_id in existing:
+                raise BusinessError("该保管员已见证释放，不能重复见证", 409, "duplicate_witness")
+            conn.execute(
+                "INSERT INTO release_witnesses(evidence_id,user_id,witnessed_at) VALUES(?,?,?)",
+                (evidence_id, user_id, now()),
+            )
+            witnesses = existing + [user_id]
+            if len(witnesses) < 2:
+                return {"id": evidence_id, "status": "pending_release", "witness_count": len(witnesses), "witnesses": witnesses}
+            self._check_expected_tail(conn, evidence_id, expected_tail)
+            witness_note = f"两名保管员见证释放: {witnesses[0]}、{witnesses[1]}。{note.strip()}"
+            self._append_event(conn, evidence_id, "RELEASE", user_id, from_person=row["current_custodian"], to_person=recipient.strip(), note=witness_note)
+            conn.execute("UPDATE evidence SET status='released' WHERE id=?", (evidence_id,))
+            self._audit(conn, row["case_id"], user_id, "evidence.release", {"evidence_id": evidence_id, "recipient": recipient.strip(), "witnesses": witnesses})
+            return {"id": evidence_id, "status": "released", "recipient": recipient.strip(), "witnesses": witnesses, "chain_tail": self._tail_info(conn, evidence_id)}
+
+        return self._run_write(op)
 
     def report(self, user_id, case_id):
         with self.connect() as conn:
             self._member(conn, case_id, user_id)
             case = self._case(conn, case_id)
             items, all_valid = [], True
+            issues = []
             for row in conn.execute("SELECT * FROM evidence WHERE case_id=? ORDER BY id", (case_id,)).fetchall():
                 hash_valid = hashlib.sha256(row["content"]).hexdigest() == row["sha256"]
                 events = conn.execute("SELECT * FROM custody_events WHERE evidence_id=? ORDER BY sequence", (row["id"],)).fetchall()
@@ -374,19 +493,36 @@ class CustodyStore:
                     if e["previous_hash"] != expected_prev or self._event_hash(payload) != e["event_hash"]:
                         chain_valid = False
                     expected_prev = e["event_hash"]
-                all_valid = all_valid and hash_valid and chain_valid
+                witnesses = [
+                    r["user_id"] for r in conn.execute(
+                        "SELECT user_id FROM release_witnesses WHERE evidence_id=? ORDER BY id", (row["id"],)
+                    ).fetchall()
+                ]
+                distinct = len(witnesses) == len(set(witnesses))
+                released = row["status"] == "released"
+                witness_valid = distinct and (not released or len(witnesses) == 2)
+                pending_release = not released and len(witnesses) > 0
+                if not chain_valid:
+                    issues.append({"evidence_id": row["id"], "label": row["label"], "problem": "broken_chain"})
+                if not distinct:
+                    issues.append({"evidence_id": row["id"], "label": row["label"], "problem": "duplicate_witness"})
+                if released and len(witnesses) != 2:
+                    issues.append({"evidence_id": row["id"], "label": row["label"], "problem": "missing_witness"})
+                all_valid = all_valid and hash_valid and chain_valid and witness_valid
                 items.append({
                     "id": row["id"], "label": row["label"], "filename": row["filename"], "sha256": row["sha256"],
                     "size": row["size"], "status": row["status"], "current_custodian": row["current_custodian"],
                     "legal_hold": bool(row["legal_hold"]), "retention_until": row["retention_until"],
-                    "hash_valid": hash_valid, "chain_valid": chain_valid,
+                    "hash_valid": hash_valid, "chain_valid": chain_valid, "witness_valid": witness_valid,
+                    "pending_release": pending_release, "release_witnesses": witnesses,
+                    "chain_tail": self._tail_info(conn, row["id"]),
                     "events": [dict(e) for e in events],
                     "derivatives": [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (row["id"],)).fetchall()],
                 })
             audit = conn.execute("SELECT * FROM audit_log WHERE case_id=? ORDER BY id", (case_id,)).fetchall()
             return {
                 "case": dict(case), "generated_at": now(), "overall_integrity_valid": all_valid,
-                "evidence_count": len(items), "evidence": items,
+                "evidence_count": len(items), "evidence": items, "issues": issues,
                 "audit": [dict(a) | {"detail": json.loads(a["detail"])} for a in audit],
             }
 
@@ -425,11 +561,14 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==3 and method=="GET": return self._send(200,store.get_evidence(user,evidence_id,bool(urlparse(self.path).query)))
             if len(parts)==4 and method=="POST":
                 d=self._body()
-                if parts[3]=="transfer": return self._send(200,store.transfer(user,evidence_id,d.get("to_person",""),d.get("location",""),d.get("note","")))
-                if parts[3]=="open": return self._send(200,store.open_evidence(user,evidence_id,d.get("location",""),d.get("note","")))
+                expected_tail=d.get("expected_tail")
+                if parts[3]=="transfer": return self._send(200,store.transfer(user,evidence_id,d.get("to_person",""),d.get("location",""),d.get("note",""),expected_tail))
+                if parts[3]=="open": return self._send(200,store.open_evidence(user,evidence_id,d.get("location",""),d.get("note",""),expected_tail))
                 if parts[3]=="derive": return self._send(201,store.derive(user,evidence_id,d.get("method",""),d.get("label",""),d.get("filename",""),d.get("content_b64","")))
-                if parts[3]=="release": return self._send(200,store.release(user,evidence_id,d.get("recipient",""),d.get("note","")))
+                if parts[3]=="release": return self._send(200,store.release(user,evidence_id,d.get("recipient",""),d.get("note",""),expected_tail))
                 if parts[3]=="hold": return self._send(200,store.set_hold(user,evidence_id,bool(d.get("hold")),d.get("reason","")))
+                if parts[3]=="retention": return self._send(200,store.set_retention(user,evidence_id,d.get("retention_until",""),d.get("reason","")))
+                if parts[3]=="conclusion": return self._send(200,store.confirm_conclusion(user,evidence_id,d.get("note","")))
         raise BusinessError("接口不存在",404,"not_found")
     def _handle(self, method):
         try: self._dispatch(method)

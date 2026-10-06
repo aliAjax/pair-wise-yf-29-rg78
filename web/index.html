@@ -1,4 +1,156 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>法律证据保管</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,input,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>法律证据保管与流转</h1><div class="panel"><select id="user"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select><input id="case" value="1"><button onclick="load()">生成保管报告</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/cases/${case.value}/report`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>法律证据保管</title>
+<style>
+body{font:16px system-ui;max-width:1000px;margin:32px auto;padding:0 16px}
+select,input,button{padding:8px;margin:4px}
+button{cursor:pointer}
+pre{background:#f4f4f4;padding:12px;white-space:pre-wrap;word-break:break-all}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}
+.ev{border:1px solid #ccc;border-radius:8px;padding:12px;margin-bottom:12px}
+.ev h3{margin:0 0 8px}
+.tail{font-family:monospace;background:#eef;padding:2px 6px;border-radius:4px}
+.bad{color:#b00020;font-weight:bold}
+.ok{color:#0a7d28;font-weight:bold}
+.muted{color:#666}
+.row{margin:6px 0}
+.issues{background:#fff3f3;border:1px solid #e0b4b4;padding:8px;border-radius:6px;margin-top:8px}
+</style>
+</head>
+<body>
+<h1>法律证据保管与流转</h1>
+<div class="panel">
+  <label>用户 <select id="user">
+    <option>custodian1</option><option>custodian2</option>
+    <option>analyst1</option><option>auditor1</option><option>outsider</option>
+  </select></label>
+  <label>案件 ID <input id="case" value="1" size="4"></label>
+  <button onclick="loadEvidence()">加载证据</button>
+  <button onclick="loadReport()">生成保管报告</button>
+  <div class="muted">每次提交会带上当前看到的链尾；若链位已被占用，将提示重新查看。</div>
+</div>
+<div id="issues"></div>
+<div id="evidenceList"></div>
+<pre id="out"></pre>
+<script>
+const $ = id => document.getElementById(id);
+const tailCache = {};   // evidence_id -> 本次查看到的链尾哈希
+
+async function api(path, opts={}) {
+  opts.headers = Object.assign({"X-User-Id": $("user").value}, opts.headers||{});
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(()=>({}));
+  if (!r.ok) {
+    const e = new Error((data.error&&data.error.message)||"请求失败");
+    e.code = data.error&&data.error.code;
+    e.status = r.status;
+    throw e;
+  }
+  return data;
+}
+
+function tailHtml(ev) {
+  if (!ev.chain_tail) return '<span class="muted">无链尾</span>';
+  return `<span class="tail" title="${ev.chain_tail.created_at}">#${ev.chain_tail.sequence} ${ev.chain_tail.event_hash.slice(0,12)}…</span>`;
+}
+
+function renderEvidence(ev) {
+  tailCache[ev.id] = ev.chain_tail ? ev.chain_tail.event_hash : null;
+  const hold = ev.legal_hold ? '<span class="bad">法律保留中</span>' : '<span class="ok">无保留</span>';
+  const concl = ev.conclusion_valid ? '<span class="ok">已确认</span>' : '<span class="bad">需重新确认</span>';
+  const witnesses = (ev.release_witnesses||[]).join("、") || '<span class="muted">无</span>';
+  const div = document.createElement("div");
+  div.className = "ev";
+  div.innerHTML = `
+    <h3>#${ev.id} ${ev.label} <span class="muted">(${ev.filename})</span></h3>
+    <div class="row">状态：<b>${ev.status}</b>　保管人：${ev.current_custodian}　${hold}</div>
+    <div class="row">保留期限：${ev.retention_until}　保管结论：${concl}</div>
+    <div class="row">链尾：${tailHtml(ev)}</div>
+    <div class="row">释放见证：${witnesses}</div>
+    <div class="row">
+      <button onclick="act(${ev.id},'open')">开箱</button>
+      <button onclick="act(${ev.id},'transfer')">移交</button>
+      <button onclick="act(${ev.id},'release')">释放</button>
+      <button onclick="act(${ev.id},'retention')">修改保留期限</button>
+      <button onclick="act(${ev.id},'conclusion')">确认保管结论</button>
+    </div>`;
+  return div;
+}
+
+async function loadEvidence() {
+  const cid = $("case").value;
+  try {
+    const rep = await api(`/api/cases/${cid}/report`);
+    const list = $("evidenceList");
+    list.innerHTML = "";
+    rep.evidence.forEach(ev => list.appendChild(renderEvidence(ev)));
+    const iss = $("issues");
+    if (rep.issues && rep.issues.length) {
+      iss.innerHTML = '<div class="issues"><b>发现问题（点名证据编号）：</b><ul>' +
+        rep.issues.map(i => `<li>#${i.evidence_id} ${i.label}：${i.problem}</li>`).join("") + '</ul></div>';
+    } else {
+      iss.innerHTML = '<div class="ok">未发现断链或重复见证。</div>';
+    }
+    $("out").textContent = "";
+  } catch(e) { $("out").textContent = "加载失败：" + e.message; }
+}
+
+async function loadReport() {
+  const cid = $("case").value;
+  try {
+    const rep = await api(`/api/cases/${cid}/report`);
+    $("out").textContent = JSON.stringify(rep, null, 2);
+  } catch(e) { $("out").textContent = "生成报告失败：" + e.message; }
+}
+
+async function act(evidenceId, action) {
+  const body = {expected_tail: tailCache[evidenceId] ?? null};
+  if (action === "open") {
+    body.location = prompt("开箱地点：", "A 区证物室");
+    if (body.location === null) return;
+    body.note = prompt("备注：", "两名人员在场开箱") || "";
+  } else if (action === "transfer") {
+    body.to_person = prompt("接收保管员：", "custodian2");
+    if (body.to_person === null) return;
+    body.location = prompt("保管位置：", "法院证物库");
+    if (body.location === null) return;
+    body.note = prompt("备注：", "") || "";
+  } else if (action === "release") {
+    body.recipient = prompt("接收方：", "检察机关");
+    if (body.recipient === null) return;
+    body.note = prompt("备注：", "") || "";
+  } else if (action === "retention") {
+    body.retention_until = prompt("新的保留期限（YYYY-MM-DD）：", "");
+    if (body.retention_until === null) return;
+    body.reason = prompt("变更原因（至少 5 字）：", "保留期限届满续期");
+    if (body.reason === null) return;
+  } else if (action === "conclusion") {
+    body.note = prompt("备注（可选）：", "") || "";
+  }
+  try {
+    const r = await api(`/api/evidence/${evidenceId}/${action}`, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(body)
+    });
+    if (action === "release" && r.status === "pending_release") {
+      alert(`已记录第 ${r.witness_count} 名见证人，还需另一名保管员见证后才释放。`);
+    }
+    await loadEvidence();
+  } catch(e) {
+    if (e.code === "chain_conflict") {
+      alert("链位已被占用或链尾已变化，请重新查看后再提交。");
+      await loadEvidence();
+    } else if (e.code === "conclusion_required") {
+      alert("保管结论未确认或保留期限已变化，请先确认保管结论。");
+    } else {
+      alert("操作失败：" + e.message);
+    }
+  }
+}
+</script>
+</body>
+</html>

@@ -1,4 +1,102 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>法律证据保管</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,input,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>法律证据保管与流转</h1><div class="panel"><select id="user"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select><input id="case" value="1"><button onclick="load()">生成保管报告</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/cases/${case.value}/report`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}
+select,input,button{padding:8px;margin:4px}
+pre{background:#f4f4f4;padding:12px;white-space:pre-wrap;word-break:break-all}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:14px}
+.tail{font-family:ui-monospace,SFMono-Regular,monospace;background:#fff8dc;border:1px solid #d6c656;padding:10px;border-radius:6px;word-break:break-all;font-size:14px}
+.warn{color:#b00020;font-weight:600}
+label{display:inline-block;min-width:76px}
+</style></head>
+<body><h1>法律证据保管与流转</h1>
+<div class="panel">
+身份 <select id="userSel"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select>
+案件 <input id="caseId" value="1" size="5">
+证据 <input id="evId" size="5">
+<button id="viewBtn">查看证据</button>
+<button id="reportBtn">生成保管报告</button>
+</div>
+<div class="panel" id="evPanel" hidden>
+<div class="tail" id="tailBox"></div>
+<p id="evMeta"></p>
+<h3>保管操作（每次提交自动携带当前链尾）</h3>
+<div><label>地点</label><input id="loc" placeholder="A 区证物室">
+<button data-act="open">开箱</button>
+<label>移交给</label><input id="toPerson" placeholder="custodian2">
+<button data-act="transfer">移交</button></div>
+<div><label>备注</label><input id="note" placeholder="操作备注"></div>
+<div><label>保留原因</label><input id="holdReason" placeholder="诉讼保全要求（至少 5 字）">
+<button data-act="holdOn">设置法律保留</button><button data-act="holdOff">解除法律保留</button></div>
+<div><label>保留期限</label><input id="retDate" type="date">
+<label>变更理由</label><input id="retReason" placeholder="裁定延长">
+<button data-act="retention">变更保留期限</button></div>
+<div><label>保管结论</label><input id="conclusion" placeholder="核对无误，继续保管（至少 5 字）">
+<button data-act="reconfirm">重新确认保管结论</button></div>
+<div><label>释放接收方</label><input id="recipient" placeholder="检察机关">
+<button data-act="release">释放见证（需两名保管员分别见证）</button></div>
+</div>
+<pre id="outBox"></pre>
+<script>
+const $ = id => document.getElementById(id);
+let chainTail = null;
+
+async function api(path, method, body) {
+  const opt = {method, headers: {"X-User-Id": $("userSel").value}};
+  if (body !== undefined) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  const r = await fetch(path, opt);
+  const j = await r.json();
+  if (!r.ok) {
+    const err = new Error(j.error ? j.error.message : ("HTTP " + r.status));
+    err.code = j.error && j.error.code;
+    throw err;
+  }
+  return j;
+}
+
+async function viewEvidence() {
+  if (!$("evId").value) return;
+  try {
+    const j = await api(`/api/evidence/${$("evId").value}`, "GET");
+    chainTail = j.chain_tail;
+    $("evPanel").hidden = false;
+    $("tailBox").innerHTML = `当前链尾：<b>${j.chain_tail}</b>（链长 ${j.chain_length}）`;
+    const flags = [];
+    if (j.legal_hold) flags.push("法律保留中");
+    if (j.needs_reconfirm) flags.push("保留期限已变更，待重新确认保管结论");
+    if (j.release_witnesses.length) flags.push("已见证：" + j.release_witnesses.map(w => w.actor_id).join("、"));
+    $("evMeta").innerHTML = `状态 ${j.status} ｜ 保管人 ${j.current_custodian} ｜ 保留期限 ${j.retention_until}` +
+      (flags.length ? `<br><span class="warn">${flags.join(" ｜ ")}</span>` : "");
+    $("outBox").textContent = JSON.stringify(j, null, 2);
+  } catch (e) { $("outBox").textContent = e.message; }
+}
+
+async function submit(path, body) {
+  try {
+    const j = await api(`/api/evidence/${$("evId").value}/${path}`, "POST", {...body, expected_tail: chainTail});
+    $("outBox").textContent = JSON.stringify(j, null, 2);
+    await viewEvidence();
+  } catch (e) {
+    if (e.code === "chain_conflict") {
+      alert("链位已被占用，请重新查看最新链尾后再提交");
+      viewEvidence();
+    }
+    $("outBox").textContent = e.message;
+  }
+}
+
+const actions = {
+  open: () => submit("open", {location: $("loc").value, note: $("note").value}),
+  transfer: () => submit("transfer", {to_person: $("toPerson").value, location: $("loc").value, note: $("note").value}),
+  holdOn: () => submit("hold", {hold: true, reason: $("holdReason").value}),
+  holdOff: () => submit("hold", {hold: false, reason: $("holdReason").value}),
+  retention: () => submit("retention", {retention_until: $("retDate").value, reason: $("retReason").value}),
+  reconfirm: () => submit("reconfirm", {conclusion: $("conclusion").value}),
+  release: () => submit("release", {recipient: $("recipient").value, note: $("note").value}),
+};
+document.querySelectorAll("[data-act]").forEach(b => b.onclick = actions[b.dataset.act]);
+$("viewBtn").onclick = viewEvidence;
+$("reportBtn").onclick = async () => {
+  try { $("outBox").textContent = JSON.stringify(await api(`/api/cases/${$("caseId").value}/report`, "GET"), null, 2); }
+  catch (e) { $("outBox").textContent = e.message; }
+};
+</script></body></html>
